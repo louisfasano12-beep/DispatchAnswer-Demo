@@ -1,78 +1,32 @@
-// Always run fresh; never cache this route.
 export const dynamic = "force-dynamic";
-
-/* ---------------------------------------------------------------
-   Rate limiting (inlined). Uses Upstash Redis REST when
-   UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set
-   (durable across serverless instances); otherwise falls back to
-   an in-memory store that resets on cold start.
-----------------------------------------------------------------*/
-const hasUpstash =
-  !!process.env.UPSTASH_REDIS_REST_URL &&
-  !!process.env.UPSTASH_REDIS_REST_TOKEN;
-
-async function upstash(command) {
-  const res = await fetch(process.env.UPSTASH_REDIS_REST_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(command),
-  });
-  if (!res.ok) throw new Error(`Upstash error ${res.status}`);
-  const json = await res.json();
-  return json.result;
-}
 
 const mem = new Map();
 const memCounters = new Map();
 
-async function numberInCooldown(phone, cooldownMinutes) {
-  const seconds = Math.max(1, cooldownMinutes) * 60;
-  const key = `cooldown:${phone}`;
-  if (hasUpstash) {
-    const result = await upstash(["SET", key, "1", "NX", "EX", String(seconds)]);
-    return result === null;
-  }
+function numberInCooldown(phone, minutes) {
   const now = Date.now();
-  const exp = mem.get(key);
+  const exp = mem.get(phone);
   if (exp && exp > now) return true;
-  mem.set(key, now + seconds * 1000);
+  mem.set(phone, now + Math.max(1, minutes) * 60000);
   return false;
 }
 
-async function ipOverDailyLimit(ip, dailyLimit) {
-  const seconds = 24 * 60 * 60;
-  const key = `ipcount:${ip}`;
-  if (hasUpstash) {
-    const count = await upstash(["INCR", key]);
-    if (count === 1) await upstash(["EXPIRE", key, String(seconds)]);
-    return count > dailyLimit;
-  }
+function ipOverDailyLimit(ip, limit) {
   const now = Date.now();
-  const entry = memCounters.get(key);
-  if (!entry || entry.expiresAtMs <= now) {
-    memCounters.set(key, { count: 1, expiresAtMs: now + seconds * 1000 });
-    return 1 > dailyLimit;
+  const e = memCounters.get(ip);
+  if (!e || e.exp <= now) {
+    memCounters.set(ip, { count: 1, exp: now + 86400000 });
+    return 1 > limit;
   }
-  entry.count += 1;
-  return entry.count > dailyLimit;
+  e.count += 1;
+  return e.count > limit;
 }
-
-/* --------------------------------------------------------------- */
 
 function toE164US(raw) {
-  const digits = (raw || "").replace(/\D/g, "");
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  const d = (raw || "").replace(/\D/g, "");
+  if (d.length === 10) return "+1" + d;
+  if (d.length === 11 && d[0] === "1") return "+" + d;
   return null;
-}
-
-function getClientIp(req) {
-  const fwd = req.headers.get("x-forwarded-for");
-  if (fwd) return fwd.split(",")[0].trim();
-  return req.headers.get("x-real-ip") || "unknown";
 }
 
 export async function POST(req) {
@@ -83,78 +37,66 @@ export async function POST(req) {
     return Response.json({ error: "Invalid request." }, { status: 400 });
   }
 
-  const toNumber = toE164US(body.phone);
-  if (!toNumber) {
+  const to = toE164US(body.phone);
+  if (!to) {
     return Response.json(
       { error: "Please enter a valid 10-digit US phone number." },
       { status: 400 }
     );
   }
 
-  const apiKey = process.env.RETELL_API_KEY;
+  const apiKey = process.env.RETELL_API_KEY || process.env.Retell_API_KEY;
   const fromNumber = process.env.RETELL_FROM_NUMBER;
   const agentId = process.env.RETELL_AGENT_ID;
-  const cooldownMinutes = Number(process.env.DEMO_COOLDOWN_MINUTES || 10);
-  const ipDailyLimit = Number(process.env.DEMO_IP_DAILY_LIMIT || 5);
+  const cooldown = Number(process.env.DEMO_COOLDOWN_MINUTES || 10);
+  const ipLimit = Number(process.env.DEMO_IP_DAILY_LIMIT || 5);
 
   if (!apiKey || !fromNumber) {
-    console.error("Missing RETELL_API_KEY or RETELL_FROM_NUMBER env vars.");
     return Response.json(
       { error: "Demo is temporarily unavailable. Please try again later." },
       { status: 500 }
     );
   }
 
-  try {
-    const ip = getClientIp(req);
-    if (await ipOverDailyLimit(ip, ipDailyLimit)) {
-      return Response.json(
-        { error: "Daily demo limit reached. Please try again tomorrow." },
-        { status: 429 }
-      );
-    }
-    if (await numberInCooldown(toNumber, cooldownMinutes)) {
-      return Response.json(
-        {
-          error: `We just called that number. Give it ${cooldownMinutes} minutes before requesting another demo.`,
-        },
-        { status: 429 }
-      );
-    }
-  } catch (e) {
-    console.error("Rate limit check failed (continuing):", e);
+  const fwd = req.headers.get("x-forwarded-for");
+  const ip = fwd ? fwd.split(",")[0].trim() : "unknown";
+  if (ipOverDailyLimit(ip, ipLimit)) {
+    return Response.json(
+      { error: "Daily demo limit reached. Please try again tomorrow." },
+      { status: 429 }
+    );
+  }
+  if (numberInCooldown(to, cooldown)) {
+    return Response.json(
+      { error: "We just called that number. Give it a few minutes before requesting another demo." },
+      { status: 429 }
+    );
   }
 
   const payload = {
     from_number: fromNumber,
-    to_number: toNumber,
+    to_number: to,
     metadata: { source: "landing_page_demo" },
   };
   if (agentId) payload.override_agent_id = agentId;
 
   try {
-    const retellRes = await fetch(
-      "https://api.retellai.com/v2/create-phone-call",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }
-    );
-
-    if (!retellRes.ok) {
-      const detail = await retellRes.text();
-      console.error("Retell API error", retellRes.status, detail);
+    const r = await fetch("https://api.retellai.com/v2/create-phone-call", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      console.error("Retell error", r.status, await r.text());
       return Response.json(
         { error: "Could not place the call right now. Please try again." },
         { status: 502 }
       );
     }
-
-    const call = await retellRes.json();
+    const call = await r.json();
     return Response.json({ ok: true, call_id: call.call_id });
   } catch (e) {
     console.error("Retell request failed:", e);
